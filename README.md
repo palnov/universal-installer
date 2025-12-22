@@ -1,2 +1,2 @@
-# n8n-universal-installer
-Universal Installer n8n on VPS
+# universal-installer
+Universal Installer of different services on VPS
