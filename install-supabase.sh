@@ -1,6 +1,6 @@
 #!/bin/bash
 # Автоматический установщик Supabase (с поддержкой n8n)
-# Может быть запущен много раз — безопасно.
+# Безопасен для повторного запуска. Устойчив к спецсимволам.
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
 set -e
@@ -19,7 +19,6 @@ EXISTS_N8N=false
 USE_EXISTING_N8N=false
 ALREADY_INSTALLED=false
 
-# Переменные
 MAIN_DOMAIN=""
 SUBDOMAIN=""
 SSL_EMAIL=""
@@ -44,7 +43,7 @@ check_ubuntu_version() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         case $VERSION_ID in
-            "20.04"|"22.04"|"24.04") ;;
+            "20.0.4"|"22.04"|"24.04") ;;
             *) print_error "Поддерживается только Ubuntu 20.04/22.04/24.04"; exit 1 ;;
         esac
     else
@@ -58,7 +57,6 @@ install_docker() {
         return
     fi
 
-    # Ждём освобождения apt
     print_info "Проверка блокировки apt..."
     retry_count=0
     max_retries=30
@@ -76,7 +74,6 @@ install_docker() {
     done
     print_success "Блокировка apt снята"
 
-    # Установка Docker
     apt update
     apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
@@ -88,7 +85,6 @@ install_docker() {
 }
 
 check_already_installed() {
-    # Интеграция в n8n
     if [ -f "$N8N_PROJECT_DIR/.env" ] && grep -q "JWT_SECRET" "$N8N_PROJECT_DIR/.env"; then
         ALREADY_INSTALLED=true
         USE_EXISTING_N8N=true
@@ -98,7 +94,6 @@ check_already_installed() {
         return
     fi
 
-    # Отдельная установка
     if [ -f "$SUPABASE_PROJECT_DIR/.env" ]; then
         if docker compose -f "$SUPABASE_PROJECT_DIR/docker-compose.yml" ps 2>/dev/null | grep -q "supabase-studio.*Up"; then
             ALREADY_INSTALLED=true
@@ -288,6 +283,7 @@ is_supabase_in_n8n() {
     [ -f "$N8N_PROJECT_DIR/docker-compose.yml" ] && grep -q "supabase-studio" "$N8N_PROJECT_DIR/docker-compose.yml"
 }
 
+# === ИСПРАВЛЕНА: безопасная вставка без awk ===
 add_to_n8n() {
     if is_supabase_in_n8n; then
         print_info "Supabase уже добавлен в n8n — пропускаем"
@@ -296,21 +292,40 @@ add_to_n8n() {
 
     print_info "Добавление Supabase в n8n..."
     cd "$N8N_PROJECT_DIR"
+
     cp docker-compose.yml "docker-compose.yml.bak.$(date +%s)"
 
-    awk -v supa="$(generate_supabase_services)" '
-    /^volumes:/ {
-        print supa
-        print ""
-    }
-    { print }
-    ' docker-compose.yml > docker-compose.yml.tmp
+    # Генерируем сервисы во временный файл
+    TEMP_SERVICES="/tmp/supabase_services_$$"
+    generate_supabase_services > "$TEMP_SERVICES"
 
+    # Вставляем перед volumes
+    if grep -q "^volumes:" docker-compose.yml; then
+        # Создаём новый файл: всё до volumes + сервисы + volumes и ниже
+        awk -v temp_file="$TEMP_SERVICES" '
+        /^volumes:/ {
+            while ((getline line < temp_file) > 0) {
+                print line
+            }
+            close(temp_file)
+            print ""
+        }
+        { print }
+        ' docker-compose.yml > docker-compose.yml.tmp
+    else
+        # Если volumes нет (маловероятно), добавляем в конец
+        cat "$TEMP_SERVICES" >> docker-compose.yml
+        echo "volumes:" >> docker-compose.yml
+    fi
+
+    # Добавляем volume-ы
     echo "  supabase_db:" >> docker-compose.yml.tmp
     echo "  supabase_storage:" >> docker-compose.yml.tmp
 
     mv docker-compose.yml.tmp docker-compose.yml
+    rm -f "$TEMP_SERVICES"
 
+    # Обновляем .env
     if ! grep -q "JWT_SECRET" .env; then
         cat >> .env << EOF
 
