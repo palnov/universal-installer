@@ -1,6 +1,6 @@
 #!/bin/bash
 # Автоматический установщик Supabase (с поддержкой n8n)
-# Исправлено: синтаксическая ошибка в add_to_n8n
+# Работает на Ubuntu 20.04/22.04/24.04, совместим с root-доступом
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
 set -e
@@ -44,7 +44,7 @@ check_ubuntu_version() {
         . /etc/os-release
         case $VERSION_ID in
             "20.04"|"22.04"|"24.04") ;;
-            *) print_error "Поддерживается только Ubuntu 20.04/22.04/24.04"; exit 1 ;;
+            *) print_error "Поддерживается только Ubuntu 20.04/22.04/24.04 LTS"; exit 1 ;;
         esac
     else
         print_error "Не удалось определить ОС"; exit 1
@@ -117,19 +117,39 @@ detect_n8n() {
 }
 
 setup_parameters() {
+    local domain_regex='^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    local email_regex='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
     if [ -z "$MAIN_DOMAIN" ]; then
         read -p "Основной домен (например: yourdomain.ru): " MAIN_DOMAIN
-        [[ -z "$MAIN_DOMAIN" || ! $MAIN_DOMAIN =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && { print_error "Неверный домен"; exit 1; }
+        if [ -z "$MAIN_DOMAIN" ]; then
+            print_error "Домен не может быть пустым"
+            exit 1
+        fi
+        if [[ ! $MAIN_DOMAIN =~ $domain_regex ]]; then
+            print_error "Неверный формат домена"
+            exit 1
+        fi
     fi
 
     if [ -z "$SUBDOMAIN" ]; then
         read -p "Поддомен для Supabase (например: supa): " SUBDOMAIN
-        [[ -z "$SUBDOMAIN" ]] && { print_error "Поддомен обязателен"; exit 1; }
+        if [ -z "$SUBDOMAIN" ]; then
+            print_error "Поддомен обязателен"
+            exit 1
+        fi
     fi
 
     if [ -z "$SSL_EMAIL" ]; then
         read -p "Email для Let's Encrypt: " SSL_EMAIL
-        [[ -z "$SSL_EMAIL" || ! $SSL_EMAIL =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] && { print_error "Неверный email"; exit 1; }
+        if [ -z "$SSL_EMAIL" ]; then
+            print_error "Email не может быть пустым"
+            exit 1
+        fi
+        if [[ ! $SSL_EMAIL =~ $email_regex ]]; then
+            print_error "Неверный формат email"
+            exit 1
+        fi
     fi
 }
 
@@ -428,6 +448,7 @@ main() {
 case "${1:-}" in
     --help|-h)
         echo "Автоматический установщик Supabase"
+        echo "Поддерживает интеграцию с n8n и автономную установку"
         ;;
     *)
         main
