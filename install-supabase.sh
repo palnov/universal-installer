@@ -1,6 +1,6 @@
 #!/bin/bash
 # Автоматический установщик Supabase (с поддержкой n8n)
-# Работает на Ubuntu 20.04/22.04/24.04, совместим с root-доступом
+# Исправлено: pg-meta → postgres-meta, совместимость с Docker Hub
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
 set -e
@@ -254,7 +254,7 @@ EOF
       - "traefik.http.routers.postgrest.entrypoints=websecure"
       - "traefik.http.routers.postgrest.tls.certresolver=mytlschallenge"
   supabase-pg-meta:
-    image: supabase/pg-meta:v0.80.0
+    image: supabase/postgres-meta:v0.80.0
     restart: always
     environment:
       PG_META_PORT: 8080
