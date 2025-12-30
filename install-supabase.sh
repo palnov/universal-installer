@@ -1,6 +1,6 @@
 #!/bin/bash
 # Автоматический установщик Supabase (с поддержкой n8n)
-# Безопасен для повторного запуска. Устойчив к спецсимволам.
+# Исправлено: синтаксическая ошибка в add_to_n8n
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
 set -e
@@ -43,7 +43,7 @@ check_ubuntu_version() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         case $VERSION_ID in
-            "20.0.4"|"22.04"|"24.04") ;;
+            "20.04"|"22.04"|"24.04") ;;
             *) print_error "Поддерживается только Ubuntu 20.04/22.04/24.04"; exit 1 ;;
         esac
     else
@@ -283,7 +283,6 @@ is_supabase_in_n8n() {
     [ -f "$N8N_PROJECT_DIR/docker-compose.yml" ] && grep -q "supabase-studio" "$N8N_PROJECT_DIR/docker-compose.yml"
 }
 
-# === ИСПРАВЛЕНА: безопасная вставка без awk ===
 add_to_n8n() {
     if is_supabase_in_n8n; then
         print_info "Supabase уже добавлен в n8n — пропускаем"
@@ -295,13 +294,10 @@ add_to_n8n() {
 
     cp docker-compose.yml "docker-compose.yml.bak.$(date +%s)"
 
-    # Генерируем сервисы во временный файл
     TEMP_SERVICES="/tmp/supabase_services_$$"
     generate_supabase_services > "$TEMP_SERVICES"
 
-    # Вставляем перед volumes
     if grep -q "^volumes:" docker-compose.yml; then
-        # Создаём новый файл: всё до volumes + сервисы + volumes и ниже
         awk -v temp_file="$TEMP_SERVICES" '
         /^volumes:/ {
             while ((getline line < temp_file) > 0) {
@@ -313,19 +309,16 @@ add_to_n8n() {
         { print }
         ' docker-compose.yml > docker-compose.yml.tmp
     else
-        # Если volumes нет (маловероятно), добавляем в конец
-        cat "$TEMP_SERVICES" >> docker-compose.yml
-        echo "volumes:" >> docker-compose.yml
+        cat docker-compose.yml "$TEMP_SERVICES" > docker-compose.yml.tmp
+        echo "volumes:" >> docker-compose.yml.tmp
     fi
 
-    # Добавляем volume-ы
     echo "  supabase_db:" >> docker-compose.yml.tmp
     echo "  supabase_storage:" >> docker-compose.yml.tmp
 
     mv docker-compose.yml.tmp docker-compose.yml
     rm -f "$TEMP_SERVICES"
 
-    # Обновляем .env
     if ! grep -q "JWT_SECRET" .env; then
         cat >> .env << EOF
 
@@ -406,7 +399,6 @@ EOF
 }
 
 main() {
-    [[ "$EUID" -ne 0 ]] && { print_error "Запустите с sudo"; exit 1; }
     print_header "Автоматический установщик Supabase"
 
     check_ubuntu_version
@@ -436,7 +428,6 @@ main() {
 case "${1:-}" in
     --help|-h)
         echo "Автоматический установщик Supabase"
-        echo "Поддерживает интеграцию с n8n и автономную установку"
         ;;
     *)
         main
