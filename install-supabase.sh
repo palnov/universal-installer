@@ -1,5 +1,5 @@
 #!/bin/bash
-# Идемпотентный установщик Supabase (с поддержкой n8n)
+# Автоматический установщик Supabase (с поддержкой n8n)
 # Может быть запущен много раз — безопасно.
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
@@ -19,7 +19,7 @@ EXISTS_N8N=false
 USE_EXISTING_N8N=false
 ALREADY_INSTALLED=false
 
-# Переменные (могут быть загружены из .env)
+# Переменные
 MAIN_DOMAIN=""
 SUBDOMAIN=""
 SSL_EMAIL=""
@@ -53,7 +53,30 @@ check_ubuntu_version() {
 }
 
 install_docker() {
-    if command -v docker &> /dev/null && docker compose version &> /dev/null; then return; fi
+    if command -v docker &> /dev/null && docker compose version &> /dev/null; then
+        print_success "Docker и Docker Compose уже установлены"
+        return
+    fi
+
+    # Ждём освобождения apt
+    print_info "Проверка блокировки apt..."
+    retry_count=0
+    max_retries=30
+    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if [ $retry_count -ge $max_retries ]; then
+            print_error "Не удалось получить доступ к apt за $max_retries секунд"
+            print_error "Возможно, работает unattended-upgrades. Подождите и повторите."
+            exit 1
+        fi
+        print_info "Система занята (apt). Ожидание... ($((retry_count + 1))/$max_retries)"
+        sleep 2
+        retry_count=$((retry_count + 1))
+    done
+    print_success "Блокировка apt снята"
+
+    # Установка Docker
     apt update
     apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
@@ -61,25 +84,25 @@ install_docker() {
     apt update
     apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
     systemctl enable --now docker
+    print_success "Docker установлен"
 }
 
-# === Проверка: уже установлен Supabase? ===
 check_already_installed() {
-    # Случай 1: интеграция в n8n
+    # Интеграция в n8n
     if [ -f "$N8N_PROJECT_DIR/.env" ] && grep -q "JWT_SECRET" "$N8N_PROJECT_DIR/.env"; then
         ALREADY_INSTALLED=true
         USE_EXISTING_N8N=true
         EXISTS_N8N=true
-        source "$N8N_PROJECT_DIR/.env"
+        source "$N8N_PROJECT_DIR/.env" 2>/dev/null || true
         print_success "Supabase уже интегрирован в n8n — повторная установка не требуется."
         return
     fi
 
-    # Случай 2: отдельная установка
+    # Отдельная установка
     if [ -f "$SUPABASE_PROJECT_DIR/.env" ]; then
         if docker compose -f "$SUPABASE_PROJECT_DIR/docker-compose.yml" ps 2>/dev/null | grep -q "supabase-studio.*Up"; then
             ALREADY_INSTALLED=true
-            source "$SUPABASE_PROJECT_DIR/.env"
+            source "$SUPABASE_PROJECT_DIR/.env" 2>/dev/null || true
             print_success "Supabase уже установлен отдельно — повторная установка пропущена."
             return
         fi
@@ -115,7 +138,6 @@ setup_parameters() {
     fi
 }
 
-# Генерация секретов — только если их ещё нет
 generate_secrets_if_needed() {
     if [ -z "$JWT_SECRET" ]; then JWT_SECRET=$(openssl rand -hex 32); fi
     if [ -z "$ANON_KEY" ]; then ANON_KEY=$(openssl rand -hex 32); fi
@@ -139,7 +161,6 @@ post_setup_questions() {
         print_info "SMTP уже настроен — пропускаем настройку"
     fi
 
-    # Резервная копия
     BACKUP_DIR="/root/supabase-backups"
     mkdir -p "$BACKUP_DIR"
     if $USE_EXISTING_N8N && [ -f "$N8N_PROJECT_DIR/.env" ]; then
@@ -150,7 +171,6 @@ post_setup_questions() {
 }
 
 generate_supabase_services() {
-    # ... (тот же код, что и раньше — без изменений)
     cat << EOF
   supabase-db:
     image: supabase/postgres:15.1.1.67
@@ -264,7 +284,6 @@ EOF
 EOF
 }
 
-# Проверка: уже есть Supabase-сервисы в docker-compose?
 is_supabase_in_n8n() {
     [ -f "$N8N_PROJECT_DIR/docker-compose.yml" ] && grep -q "supabase-studio" "$N8N_PROJECT_DIR/docker-compose.yml"
 }
@@ -292,7 +311,6 @@ add_to_n8n() {
 
     mv docker-compose.yml.tmp docker-compose.yml
 
-    # Обновляем .env только если ключей нет
     if ! grep -q "JWT_SECRET" .env; then
         cat >> .env << EOF
 
@@ -305,7 +323,7 @@ EOF
     fi
 
     docker compose up -d
-    cd "$ORIGINAL_DIR"
+    cd "$ORIGINAL_DIR" || true
     print_success "Supabase интегрирован в n8n"
 }
 
@@ -368,13 +386,13 @@ volumes:
 EOF
 
     docker compose up -d
-    cd "$ORIGINAL_DIR"
+    cd "$ORIGINAL_DIR" || true
     print_success "Supabase установлен отдельно"
 }
 
 main() {
     [[ "$EUID" -ne 0 ]] && { print_error "Запустите с sudo"; exit 1; }
-    print_header "Идемпотентный установщик Supabase"
+    print_header "Автоматический установщик Supabase"
 
     check_ubuntu_version
     install_docker
@@ -402,7 +420,8 @@ main() {
 
 case "${1:-}" in
     --help|-h)
-        echo "Идемпотентный установщик Supabase"
+        echo "Автоматический установщик Supabase"
+        echo "Поддерживает интеграцию с n8n и автономную установку"
         ;;
     *)
         main
