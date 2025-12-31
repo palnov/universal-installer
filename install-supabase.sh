@@ -1,6 +1,6 @@
 #!/bin/bash
 # Автоматический установщик Supabase (с поддержкой n8n)
-# Исправлено: pg-meta → postgres-meta, совместимость с Docker Hub
+# Полностью совместим с Ubuntu 20.04/22.04/24.04
 # Модифицировано для ChatPilot / ИП Пальнов А.А.
 
 set -e
@@ -394,7 +394,7 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - traefik_/letsencrypt
+      - traefik_letsencrypt:/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
     labels:
       - "traefik.enable=true"
@@ -408,7 +408,7 @@ EOF
 
     cat >> docker-compose.yml << EOF
 volumes:
-  traefik_:
+  traefik_letsencrypt:
   supabase_db:
   supabase_storage:
 EOF
