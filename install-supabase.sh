@@ -1,456 +1,831 @@
-#!/bin/bash
-# Автоматический установщик Supabase (с поддержкой n8n)
-# Полностью совместим с Ubuntu 20.04/22.04/24.04
-# Модифицировано для ChatPilot / ИП Пальнов А.А.
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -e
+# --- Конфигурация ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR/supabase-docker"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+# --- Функции ---
+print_help() {
+    cat <<EOF
+Supabase Self-Hosted Docker Installer
 
-N8N_PROJECT_DIR="n8n-compose"
-SUPABASE_PROJECT_DIR="supabase-full"
-ORIGINAL_DIR="$(pwd)"
+Использование:
+  $0 [опции]
 
-EXISTS_N8N=false
-USE_EXISTING_N8N=false
-ALREADY_INSTALLED=false
+Опции:
+  -c, --configure-only   Пропустить установку зависимостей и загрузку файлов.
+                         Предполагается, что supabase-docker уже установлен.
+  -u, --update           Обновить только docker-compose файлы
+  -h, --help             Показать эту справку
 
-MAIN_DOMAIN=""
-SUBDOMAIN=""
-SSL_EMAIL=""
-JWT_SECRET=""
-ANON_KEY=""
-SERVICE_KEY=""
-POSTGRES_PASSWORD=""
-SMTP_HOST=""
-SMTP_PORT=""
-SMTP_USER=""
-SMTP_PASS=""
-SMTP_ADMIN_EMAIL=""
-ENABLE_SMTP=false
+Описание:
+  Скрипт устанавливает Supabase в self-hosted режиме с Docker Compose.
+  Без флагов выполняет полную установку.
+  С флагом -c только настраивает существующую установку.
 
-print_header() { echo -e "${BLUE}================================${NC}\n${BLUE}$1${NC}\n${BLUE}================================${NC}"; }
-print_success() { echo -e "${GREEN}✓ $1${NC}"; }
-print_warning() { echo -e "${YELLOW}⚠ $1${NC}"; }
-print_error() { echo -e "${RED}✗ $1${NC}"; }
-print_info() { echo -e "${BLUE}ℹ $1${NC}"; }
+Примеры:
+  $0                    # Полная установка
+  $0 -c                 # Только настройка
+  $0 -u                 # Обновить docker-compose файлы
+EOF
+}
 
-check_ubuntu_version() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        case $VERSION_ID in
-            "20.04"|"22.04"|"24.04") ;;
-            *) print_error "Поддерживается только Ubuntu 20.04/22.04/24.04 LTS"; exit 1 ;;
-        esac
+enable_autostart() {
+    echo "⚡ Настраиваем автозапуск при перезагрузке сервера..."
+    
+    # 1. Включаем автозапуск Docker сервиса
+    echo "🐳 Настраиваем автозапуск Docker..."
+    if sudo systemctl enable docker 2>/dev/null; then
+        echo "✅ Docker будет запускаться автоматически при загрузке системы"
     else
-        print_error "Не удалось определить ОС"; exit 1
+        echo "⚠️  Не удалось настроить автозапуск Docker"
     fi
+    
+    # 2. Создаем systemd сервис для Supabase
+    echo "🚀 Создаем systemd сервис для Supabase..."
+    
+    sudo cat > /etc/systemd/system/supabase.service <<EOF
+[Unit]
+Description=Supabase Docker Compose
+Requires=docker.service
+After=docker.service
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$PROJECT_DIR
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+ExecReload=/usr/bin/docker compose restart
+
+# Перезапускать контейнеры если они упали
+Restart=on-failure
+RestartSec=10
+
+# Устанавливаем лимиты
+LimitNOFILE=1048576
+LimitNPROC=512
+
+# Безопасность
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    # 3. Создаем таймер для периодической проверки
+    echo "⏰ Создаем таймер для автоматического перезапуска..."
+    
+    sudo cat > /etc/systemd/system/supabase-restart.timer <<EOF
+[Unit]
+Description=Weekly restart of Supabase containers
+Requires=supabase.service
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    
+    sudo cat > /etc/systemd/system/supabase-restart.service <<EOF
+[Unit]
+Description=Restart Supabase containers
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=$PROJECT_DIR
+ExecStart=/usr/bin/docker compose restart
+EOF
+    
+    # 4. Перечитываем конфигурацию systemd и включаем сервисы
+    sudo systemctl daemon-reload
+    
+    # Включаем Supabase сервис
+    if sudo systemctl enable supabase.service; then
+        echo "✅ Сервис Supabase настроен на автозапуск"
+    else
+        echo "⚠️  Не удалось включить сервис Supabase"
+    fi
+    
+    # Включаем таймер перезапуска (опционально)
+    if sudo systemctl enable supabase-restart.timer; then
+        echo "✅ Таймер перезапуска Supabase включен (раз в неделю)"
+    else
+        echo "⚠️  Не удалось включить таймер перезапуска"
+    fi
+    
+    # Запускаем таймер
+    sudo systemctl start supabase-restart.timer
+    
+    # 5. Создаем скрипт для crontab как fallback
+    echo "📋 Создаем fallback через cron..."
+    
+    sudo cat > /etc/cron.d/supabase-autostart <<EOF
+# Автозапуск Supabase при перезагрузке
+@reboot root sleep 30 && cd $PROJECT_DIR && /usr/bin/docker compose up -d > /var/log/supabase-startup.log 2>&1
+
+# Ежедневная проверка что Supabase работает
+0 3 * * * root cd $PROJECT_DIR && /usr/bin/docker compose ps | grep -q "Up" || /usr/bin/docker compose up -d >> /var/log/supabase-check.log 2>&1
+EOF
+    
+    echo "✅ Настроены multiple уровни автозапуска:"
+    echo "   1. systemd сервис (основной)"
+    echo "   2. systemd таймер (перезапуск раз в неделю)"
+    echo "   3. crontab (fallback)"
+}
+
+check_autostart_status() {
+    echo ""
+    echo "🔍 Проверка настроек автозапуска..."
+    
+    # Проверяем Docker
+    if systemctl is-enabled docker > /dev/null 2>&1; then
+        echo "✅ Docker настроен на автозапуск"
+    else
+        echo "⚠️  Docker НЕ настроен на автозапуск"
+    fi
+    
+    # Проверяем Supabase сервис
+    if [[ -f "/etc/systemd/system/supabase.service" ]]; then
+        if systemctl is-enabled supabase.service > /dev/null 2>&1; then
+            echo "✅ Сервис Supabase настроен на автозапуск"
+        else
+            echo "⚠️  Сервис Supabase НЕ настроен на автозапуск"
+        fi
+    else
+        echo "❌ Сервис Supabase не найден"
+    fi
+    
+    # Проверяем таймер
+    if [[ -f "/etc/systemd/system/supabase-restart.timer" ]]; then
+        if systemctl is-enabled supabase-restart.timer > /dev/null 2>&1; then
+            echo "✅ Таймер перезапуска Supabase активен"
+        else
+            echo "⚠️  Таймер перезапуска не активен"
+        fi
+    fi
+    
+    # Проверяем cron
+    if [[ -f "/etc/cron.d/supabase-autostart" ]]; then
+        echo "✅ Cron задачи настроены"
+    fi
+    
+    echo ""
+    echo "📋 Команды для управления:"
+    echo "   Статус Supabase: sudo systemctl status supabase"
+    echo "   Запуск Supabase: sudo systemctl start supabase"
+    echo "   Остановка Supabase: sudo systemctl stop supabase"
+    echo "   Перезапуск Supabase: sudo systemctl restart supabase"
+    echo "   Просмотр логов: sudo journalctl -u supabase -f"
+}
+
+install_dependencies() {
+    echo "📦 Обновляем систему и устанавливаем зависимости..."
+    sudo apt-get update
+    sudo apt-get install -y curl jq nginx certbot python3-certbot-nginx apache2-utils
 }
 
 install_docker() {
-    if command -v docker &> /dev/null && docker compose version &> /dev/null; then
-        print_success "Docker и Docker Compose уже установлены"
-        return
-    fi
-
-    print_info "Проверка блокировки apt..."
-    retry_count=0
-    max_retries=30
-    while fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-          fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
-        if [ $retry_count -ge $max_retries ]; then
-            print_error "Не удалось получить доступ к apt за $max_retries секунд"
-            print_error "Возможно, работает unattended-upgrades. Подождите и повторите."
-            exit 1
-        fi
-        print_info "Система занята (apt). Ожидание... ($((retry_count + 1))/$max_retries)"
-        sleep 2
-        retry_count=$((retry_count + 1))
-    done
-    print_success "Блокировка apt снята"
-
-    apt update
-    apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt update
-    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-    systemctl enable --now docker
-    print_success "Docker установлен"
-}
-
-check_already_installed() {
-    if [ -f "$N8N_PROJECT_DIR/.env" ] && grep -q "JWT_SECRET" "$N8N_PROJECT_DIR/.env"; then
-        ALREADY_INSTALLED=true
-        USE_EXISTING_N8N=true
-        EXISTS_N8N=true
-        source "$N8N_PROJECT_DIR/.env" 2>/dev/null || true
-        print_success "Supabase уже интегрирован в n8n — повторная установка не требуется."
-        return
-    fi
-
-    if [ -f "$SUPABASE_PROJECT_DIR/.env" ]; then
-        if docker compose -f "$SUPABASE_PROJECT_DIR/docker-compose.yml" ps 2>/dev/null | grep -q "supabase-studio.*Up"; then
-            ALREADY_INSTALLED=true
-            source "$SUPABASE_PROJECT_DIR/.env" 2>/dev/null || true
-            print_success "Supabase уже установлен отдельно — повторная установка пропущена."
-            return
+    echo "🐳 Устанавливаем Docker..."
+    if ! command -v docker &>/dev/null; then
+        curl -fsSL https://get.docker.com | sh
+        
+        # Сразу включаем автозапуск Docker
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        echo "✅ Docker установлен и настроен на автозапуск"
+    else
+        echo "✅ Docker уже установлен"
+        
+        # Проверяем что Docker настроен на автозапуск
+        if ! systemctl is-enabled docker > /dev/null 2>&1; then
+            echo "⚠️  Docker не настроен на автозапуск, настраиваем..."
+            sudo systemctl enable docker
         fi
     fi
 }
 
-detect_n8n() {
-    if [ -d "$N8N_PROJECT_DIR" ] && [ -f "$N8N_PROJECT_DIR/.env" ]; then
-        source "$N8N_PROJECT_DIR/.env" 2>/dev/null || true
-        if [ -n "$DOMAIN_NAME" ] && [ -n "$SSL_EMAIL" ]; then
-            EXISTS_N8N=true
-            MAIN_DOMAIN="$DOMAIN_NAME"
-            SSL_EMAIL="$SSL_EMAIL"
-            print_info "Обнаружен n8n: домен = $MAIN_DOMAIN"
-        fi
+download_docker_files() {
+    echo "📥 Загружаем файлы Docker Compose в $PROJECT_DIR..."
+    
+    # Создаем директорию
+    mkdir -p "$PROJECT_DIR"
+    
+    # URL для скачивания файлов
+    DOCKER_COMPOSE_URL="https://raw.githubusercontent.com/supabase/supabase/master/docker/docker-compose.yml"
+    ENV_EXAMPLE_URL="https://raw.githubusercontent.com/supabase/supabase/master/docker/.env.example"
+    
+    # Скачиваем docker-compose.yml
+    echo "⬇️  Загружаем docker-compose.yml..."
+    if curl -sSL -o "$PROJECT_DIR/docker-compose.yml" "$DOCKER_COMPOSE_URL"; then
+        echo "✅ docker-compose.yml загружен"
+    else
+        echo "❌ Не удалось загрузить docker-compose.yml"
+        exit 1
     fi
+    
+    # Скачиваем .env.example
+    echo "⬇️  Загружаем .env.example..."
+    if curl -sSL -o "$PROJECT_DIR/.env.example" "$ENV_EXAMPLE_URL"; then
+        echo "✅ .env.example загружен"
+    else
+        echo "⚠️  Не удалось загрузить .env.example, создаем базовый..."
+        create_basic_env_example
+    fi
+    
+    echo "✅ Файлы Docker загружены в $PROJECT_DIR"
 }
 
-setup_parameters() {
-    local domain_regex='^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    local email_regex='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+create_basic_env_example() {
+    cat > "$PROJECT_DIR/.env.example" <<'EOF'
+# Database
+POSTGRES_PASSWORD=your_postgres_password
+POSTGRES_USER=postgres
+POSTGRES_DB=postgres
+POSTGRES_HOST=db
+POSTGRES_PORT=5432
 
-    if [ -z "$MAIN_DOMAIN" ]; then
-        read -p "Основной домен (например: yourdomain.ru): " MAIN_DOMAIN
-        if [ -z "$MAIN_DOMAIN" ]; then
-            print_error "Домен не может быть пустым"
-            exit 1
-        fi
-        if [[ ! $MAIN_DOMAIN =~ $domain_regex ]]; then
-            print_error "Неверный формат домена"
-            exit 1
-        fi
-    fi
+# JWT
+JWT_SECRET=your_jwt_secret
+JWT_EXPIRY=3600
 
-    if [ -z "$SUBDOMAIN" ]; then
-        read -p "Поддомен для Supabase (например: supa): " SUBDOMAIN
-        if [ -z "$SUBDOMAIN" ]; then
-            print_error "Поддомен обязателен"
-            exit 1
-        fi
-    fi
+# API Keys
+ANON_KEY=your_anon_key
+SERVICE_ROLE_KEY=your_service_role_key
 
-    if [ -z "$SSL_EMAIL" ]; then
-        read -p "Email для Let's Encrypt: " SSL_EMAIL
-        if [ -z "$SSL_EMAIL" ]; then
-            print_error "Email не может быть пустым"
-            exit 1
-        fi
-        if [[ ! $SSL_EMAIL =~ $email_regex ]]; then
-            print_error "Неверный формат email"
-            exit 1
-        fi
-    fi
+# URLs
+SITE_URL=https://your-domain.com
+SUPABASE_PUBLIC_URL=https://your-domain.com
+API_EXTERNAL_URL=https://your-domain.com
+
+# Studio
+STUDIO_DEFAULT_ORGANIZATION=Default Organization
+STUDIO_DEFAULT_PROJECT=Default Project
+
+# Auth
+ENABLE_EMAIL_SIGNUP=true
+ENABLE_EMAIL_AUTOCONFIRM=false
+
+# Dashboard
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=password
+
+# Security
+PG_META_CRYPTO_KEY=your_pg_meta_crypto_key
+VAULT_ENC_KEY=your_vault_enc_key
+SECRET_KEY_BASE=your_secret_key_base
+
+# Pooler
+POOLER_TENANT_ID=your_pooler_tenant_id
+EOF
 }
 
-generate_secrets_if_needed() {
-    if [ -z "$JWT_SECRET" ]; then JWT_SECRET=$(openssl rand -hex 32); fi
-    if [ -z "$ANON_KEY" ]; then ANON_KEY=$(openssl rand -hex 32); fi
-    if [ -z "$SERVICE_KEY" ]; then SERVICE_KEY=$(openssl rand -hex 32); fi
-    if [ -z "$POSTGRES_PASSWORD" ]; then POSTGRES_PASSWORD=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-24); fi
-}
-
-post_setup_questions() {
-    if [ -z "$SMTP_HOST" ]; then
-        read -p "Настроить SMTP для email-верификации? (y/N): " SMTP_OPT
-        if [[ "$SMTP_OPT" =~ ^[Yy]$ ]]; then
-            read -p "SMTP хост: " SMTP_HOST
-            read -p "SMTP порт: " SMTP_PORT
-            read -p "SMTP пользователь: " SMTP_USER
-            read -s -p "SMTP пароль: " SMTP_PASS; echo
-            read -p "Админ email: " SMTP_ADMIN_EMAIL
-            ENABLE_SMTP=true
+update_docker_files() {
+    echo "🔄 Обновляем файлы Docker Compose в $PROJECT_DIR..."
+    
+    if [[ ! -d "$PROJECT_DIR" ]]; then
+        echo "❌ Папка $PROJECT_DIR не найдена"
+        exit 1
+    fi
+    
+    # URL для скачивания файлов
+    DOCKER_COMPOSE_URL="https://raw.githubusercontent.com/supabase/supabase/master/docker/docker-compose.yml"
+    ENV_EXAMPLE_URL="https://raw.githubusercontent.com/supabase/supabase/master/docker/.env.example"
+    
+    # Скачиваем docker-compose.yml
+    echo "⬇️  Обновляем docker-compose.yml..."
+    if curl -sSL -o "$PROJECT_DIR/docker-compose.yml.new" "$DOCKER_COMPOSE_URL"; then
+        mv "$PROJECT_DIR/docker-compose.yml.new" "$PROJECT_DIR/docker-compose.yml"
+        echo "✅ docker-compose.yml обновлен"
+    else
+        echo "❌ Не удалось обновить docker-compose.yml"
+        rm -f "$PROJECT_DIR/docker-compose.yml.new"
+    fi
+    
+    # Скачиваем .env.example
+    echo "⬇️  Обновляем .env.example..."
+    if curl -sSL -o "$PROJECT_DIR/.env.example.new" "$ENV_EXAMPLE_URL"; then
+        # Сравниваем с существующим
+        if [[ -f "$PROJECT_DIR/.env.example" ]]; then
+            if ! diff -q "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env.example.new" > /dev/null; then
+                mv "$PROJECT_DIR/.env.example.new" "$PROJECT_DIR/.env.example"
+                echo "✅ .env.example обновлен (есть изменения)"
+            else
+                rm "$PROJECT_DIR/.env.example.new"
+                echo "✅ .env.example уже актуален"
+            fi
+        else
+            mv "$PROJECT_DIR/.env.example.new" "$PROJECT_DIR/.env.example"
+            echo "✅ .env.example создан"
         fi
     else
-        ENABLE_SMTP=true
-        print_info "SMTP уже настроен — пропускаем настройку"
+        echo "❌ Не удалось обновить .env.example"
+        rm -f "$PROJECT_DIR/.env.example.new"
     fi
-
-    BACKUP_DIR="/root/supabase-backups"
-    mkdir -p "$BACKUP_DIR"
-    if $USE_EXISTING_N8N && [ -f "$N8N_PROJECT_DIR/.env" ]; then
-        cp "$N8N_PROJECT_DIR/.env" "$BACKUP_DIR/.env.n8n.$(date +%s)" 2>/dev/null || true
-    elif [ -f "$SUPABASE_PROJECT_DIR/.env" ]; then
-        cp "$SUPABASE_PROJECT_DIR/.env" "$BACKUP_DIR/.env.standalone.$(date +%s)" 2>/dev/null || true
-    fi
+    
+    echo "✅ Файлы Docker обновлены"
 }
 
-generate_supabase_services() {
-    cat << EOF
-  supabase-db:
-    image: supabase/postgres:15.1.1.67
-    restart: always
-    environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - supabase_db:/var/lib/postgresql/data
-  supabase-auth:
-    image: supabase/gotrue:v2.139.1
-    restart: always
-    environment:
-      API_EXTERNAL_URL: https://auth.${SUBDOMAIN}.${MAIN_DOMAIN}
-      JWT_SECRET: ${JWT_SECRET}
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      SITE_URL: https://${SUBDOMAIN}.${MAIN_DOMAIN}
-      ADDITIONAL_REDIRECT_URLS: https://${SUBDOMAIN}.${MAIN_DOMAIN},http://localhost:3000
-EOF
-    if [[ "$ENABLE_SMTP" == "true" ]]; then
-        cat << EOF
-      GOTRUE_SMTP_HOST: ${SMTP_HOST}
-      GOTRUE_SMTP_PORT: ${SMTP_PORT}
-      GOTRUE_SMTP_USER: ${SMTP_USER}
-      GOTRUE_SMTP_PASS: ${SMTP_PASS}
-      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
-      GOTRUE_MAILER_URLPATHS_INVITE: /
-      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /
-      GOTRUE_MAILER_URLPATHS_RECOVERY: /
-      GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE: /
-EOF
-    fi
-    cat << EOF
-    depends_on: [supabase-db]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.auth.rule=Host(\`auth.${SUBDOMAIN}.${MAIN_DOMAIN}\`)"
-      - "traefik.http.routers.auth.entrypoints=websecure"
-      - "traefik.http.routers.auth.tls.certresolver=mytlschallenge"
-  supabase-storage:
-    image: supabase/storage-api:v1.13.0
-    restart: always
-    environment:
-      ANON_KEY: ${ANON_KEY}
-      SERVICE_KEY: ${SERVICE_KEY}
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      AUTH_EXTERNAL_URL: https://auth.${SUBDOMAIN}.${MAIN_DOMAIN}
-      FILE_SIZE_LIMIT: 52428800
-    volumes: [supabase_storage:/var/lib/storage]
-    depends_on: [supabase-db, supabase-auth]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.storage.rule=Host(\`storage.${SUBDOMAIN}.${MAIN_DOMAIN}\`)"
-      - "traefik.http.routers.storage.entrypoints=websecure"
-      - "traefik.http.routers.storage.tls.certresolver=mytlschallenge"
-  supabase-postgrest:
-    image: postgrest/postgrest:v12.0.3
-    restart: always
-    environment:
-      PGRST_DB_URI: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
-      PGRST_DB_ANON_ROLE: anon
-      PGRST_JWT_SECRET: ${JWT_SECRET}
-    depends_on: [supabase-db]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.postgrest.rule=Host(\`rest.${SUBDOMAIN}.${MAIN_DOMAIN}\`)"
-      - "traefik.http.routers.postgrest.entrypoints=websecure"
-      - "traefik.http.routers.postgrest.tls.certresolver=mytlschallenge"
-  supabase-pg-meta:
-    image: supabase/postgres-meta:v0.80.0
-    restart: always
-    environment:
-      PG_META_PORT: 8080
-      PG_META_DB_HOST: supabase-db
-      PG_META_DB_NAME: postgres
-      PG_META_DB_USER: postgres
-      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD}
-    depends_on: [supabase-db]
-  supabase-studio:
-    image: supabase/studio:latest
-    restart: always
-    environment:
-      STUDIO_PG_META_URL: http://supabase-pg-meta:8080
-      POSTGREST_URL: http://supabase-postgrest:3000
-      SUPABASE_URL: https://${SUBDOMAIN}.${MAIN_DOMAIN}
-      SUPABASE_PUBLIC_URL: https://${SUBDOMAIN}.${MAIN_DOMAIN}
-      ANON_KEY: ${ANON_KEY}
-      SERVICE_KEY: ${SERVICE_KEY}
-    depends_on: [supabase-pg-meta, supabase-postgrest]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.studio.rule=Host(\`${SUBDOMAIN}.${MAIN_DOMAIN}\`)"
-      - "traefik.http.routers.studio.entrypoints=websecure"
-      - "traefik.http.routers.studio.tls.certresolver=mytlschallenge"
-  supabase-realtime:
-    image: supabase/realtime:v2.28.27
-    restart: always
-    environment:
-      DB_HOST: supabase-db
-      DB_PORT: 5432
-      DB_USER: postgres
-      DB_PASSWORD: ${POSTGRES_PASSWORD}
-      DB_NAME: postgres
-      PORT: 4000
-      IP_VERSION: "v4"
-    depends_on: [supabase-db]
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.realtime.rule=Host(\`realtime.${SUBDOMAIN}.${MAIN_DOMAIN}\`)"
-      - "traefik.http.routers.realtime.entrypoints=websecure"
-      - "traefik.http.routers.realtime.tls.certresolver=mytlschallenge"
-EOF
-}
-
-is_supabase_in_n8n() {
-    [ -f "$N8N_PROJECT_DIR/docker-compose.yml" ] && grep -q "supabase-studio" "$N8N_PROJECT_DIR/docker-compose.yml"
-}
-
-add_to_n8n() {
-    if is_supabase_in_n8n; then
-        print_info "Supabase уже добавлен в n8n — пропускаем"
-        return
-    fi
-
-    print_info "Добавление Supabase в n8n..."
-    cd "$N8N_PROJECT_DIR"
-
-    cp docker-compose.yml "docker-compose.yml.bak.$(date +%s)"
-
-    TEMP_SERVICES="/tmp/supabase_services_$$"
-    generate_supabase_services > "$TEMP_SERVICES"
-
-    if grep -q "^volumes:" docker-compose.yml; then
-        awk -v temp_file="$TEMP_SERVICES" '
-        /^volumes:/ {
-            while ((getline line < temp_file) > 0) {
-                print line
-            }
-            close(temp_file)
-            print ""
-        }
-        { print }
-        ' docker-compose.yml > docker-compose.yml.tmp
+configure_env() {
+    echo "🔑 Генерируем ключи безопасности..."
+    
+    # Генерация ключей
+    local POSTGRES_PASSWORD=$(openssl rand -hex 16)
+    local JWT_SECRET=$(openssl rand -hex 32)
+    local ANON_KEY=$(openssl rand -hex 32)
+    local SERVICE_ROLE_KEY=$(openssl rand -hex 32)
+    local PG_META_CRYPTO_KEY=$(openssl rand -hex 32)
+    local VAULT_ENC_KEY=$(openssl rand -hex 32)
+    local SECRET_KEY_BASE=$(openssl rand -hex 64)
+    local POOLER_TENANT_ID=$(openssl rand -hex 16)
+    
+    echo "📝 Создаем .env файл из шаблона..."
+    
+    if [[ -f "$PROJECT_DIR/.env.example" ]]; then
+        cp "$PROJECT_DIR/.env.example" "$PROJECT_DIR/.env"
+        
+        # Обновляем значения в .env файле
+        update_env_value "POSTGRES_PASSWORD" "$POSTGRES_PASSWORD"
+        update_env_value "JWT_SECRET" "$JWT_SECRET"
+        update_env_value "ANON_KEY" "$ANON_KEY"
+        update_env_value "SERVICE_ROLE_KEY" "$SERVICE_ROLE_KEY"
+        
+        # URL настройки
+        update_env_value "SITE_URL" "https://$MAIN_DOMAIN"
+        update_env_value "SUPABASE_PUBLIC_URL" "https://$MAIN_DOMAIN"
+        update_env_value "API_EXTERNAL_URL" "https://$MAIN_DOMAIN"
+        
+        # Dashboard credentials
+        update_env_value "DASHBOARD_USERNAME" "$DASH_USER"
+        update_env_value "DASHBOARD_PASSWORD" "$DASH_PASS"
+        
+        # Дополнительные ключи безопасности
+        update_env_value "PG_META_CRYPTO_KEY" "$PG_META_CRYPTO_KEY"
+        update_env_value "VAULT_ENC_KEY" "$VAULT_ENC_KEY"
+        update_env_value "SECRET_KEY_BASE" "$SECRET_KEY_BASE"
+        update_env_value "POOLER_TENANT_ID" "$POOLER_TENANT_ID"
+        
+        # Обновляем MAILER_URLPATHS если они есть
+        update_env_value "MAILER_URLPATHS_CONFIRMATION" "https://$MAIN_DOMAIN/auth/v1/verify"
+        update_env_value "MAILER_URLPATHS_RECOVERY" "https://$MAIN_DOMAIN/auth/v1/verify"
+        update_env_value "MAILER_URLPATHS_EMAIL_CHANGE" "https://$MAIN_DOMAIN/auth/v1/verify"
+        update_env_value "MAILER_URLPATHS_INVITE" "https://$MAIN_DOMAIN/auth/v1/verify"
+        
+        # Добавляем комментарий с информацией об установке
+        echo "" >> "$PROJECT_DIR/.env"
+        echo "# Let's Encrypt email: $LE_EMAIL" >> "$PROJECT_DIR/.env"
+        echo "# Domain: $MAIN_DOMAIN" >> "$PROJECT_DIR/.env"
+        echo "# Installed on: $(date)" >> "$PROJECT_DIR/.env"
+        
+        echo "✅ Файл .env создан из шаблона"
     else
-        cat docker-compose.yml "$TEMP_SERVICES" > docker-compose.yml.tmp
-        echo "volumes:" >> docker-compose.yml.tmp
-    fi
-
-    echo "  supabase_db:" >> docker-compose.yml.tmp
-    echo "  supabase_storage:" >> docker-compose.yml.tmp
-
-    mv docker-compose.yml.tmp docker-compose.yml
-    rm -f "$TEMP_SERVICES"
-
-    if ! grep -q "JWT_SECRET" .env; then
-        cat >> .env << EOF
-
-# Supabase Secrets
-JWT_SECRET=$JWT_SECRET
-ANON_KEY=$ANON_KEY
-SERVICE_KEY=$SERVICE_KEY
+        echo "❌ Файл .env.example не найден в $PROJECT_DIR!"
+        echo "Создаем .env вручную..."
+        cat > "$PROJECT_DIR/.env" <<EOF
+# Database
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-EOF
-    fi
+POSTGRES_USER=postgres
+POSTGRES_DB=postgres
+POSTGRES_HOST=db
+POSTGRES_PORT=5432
 
-    docker compose up -d
-    cd "$ORIGINAL_DIR" || true
-    print_success "Supabase интегрирован в n8n"
-}
-
-full_install() {
-    if [ -d "$SUPABASE_PROJECT_DIR" ] && docker compose -f "$SUPABASE_PROJECT_DIR/docker-compose.yml" ps 2>/dev/null | grep -q "supabase-studio.*Up"; then
-        print_info "Supabase уже установлен отдельно — пропускаем"
-        return
-    fi
-
-    mkdir -p "$SUPABASE_PROJECT_DIR"
-    cd "$SUPABASE_PROJECT_DIR"
-
-    cat > .env << EOF
-DOMAIN_NAME=$MAIN_DOMAIN
-SUBDOMAIN=$SUBDOMAIN
-SSL_EMAIL=$SSL_EMAIL
+# JWT
 JWT_SECRET=$JWT_SECRET
+JWT_EXPIRY=3600
+
+# API Keys
 ANON_KEY=$ANON_KEY
-SERVICE_KEY=$SERVICE_KEY
-POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+SERVICE_ROLE_KEY=$SERVICE_ROLE_KEY
+
+# URLs
+SITE_URL=https://$MAIN_DOMAIN
+SUPABASE_PUBLIC_URL=https://$MAIN_DOMAIN
+API_EXTERNAL_URL=https://$MAIN_DOMAIN
+
+# Studio
+STUDIO_DEFAULT_ORGANIZATION=Default Organization
+STUDIO_DEFAULT_PROJECT=Default Project
+
+# Auth
+ENABLE_EMAIL_SIGNUP=true
+ENABLE_EMAIL_AUTOCONFIRM=false
+
+# Dashboard
+DASHBOARD_USERNAME=$DASH_USER
+DASHBOARD_PASSWORD=$DASH_PASS
+
+# Security
+PG_META_CRYPTO_KEY=$PG_META_CRYPTO_KEY
+VAULT_ENC_KEY=$VAULT_ENC_KEY
+SECRET_KEY_BASE=$SECRET_KEY_BASE
+
+# Pooler
+POOLER_TENANT_ID=$POOLER_TENANT_ID
+
+# Let's Encrypt email: $LE_EMAIL
+# Domain: $MAIN_DOMAIN
+# Installed on: $(date)
 EOF
-
-    cat > docker-compose.yml << 'EOF'
-name: supabase
-services:
-  traefik:
-    image: traefik:v3.0
-    restart: always
-    command:
-      - "--api.insecure=true"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.mytlschallenge.acme.tlschallenge=true"
-      - "--certificatesresolvers.mytlschallenge.acme.email=${SSL_EMAIL}"
-      - "--certificatesresolvers.mytlschallenge.acme.storage=/letsencrypt/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - traefik_letsencrypt:/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN_NAME}`)"
-      - "traefik.http.routers.traefik.entrypoints=websecure"
-      - "traefik.http.routers.traefik.tls.certresolver=mytlschallenge"
-      - "traefik.http.routers.traefik.service=api@internal"
-EOF
-
-    generate_supabase_services >> docker-compose.yml
-
-    cat >> docker-compose.yml << EOF
-volumes:
-  traefik_letsencrypt:
-  supabase_db:
-  supabase_storage:
-EOF
-
-    docker compose up -d
-    cd "$ORIGINAL_DIR" || true
-    print_success "Supabase установлен отдельно"
+    fi
+    
+    # Сохраняем ключи для показа пользователю
+    save_keys_to_file \
+        "$MAIN_DOMAIN" \
+        "$DASH_USER" \
+        "$DASH_PASS" \
+        "$POSTGRES_PASSWORD" \
+        "$JWT_SECRET" \
+        "$ANON_KEY" \
+        "$SERVICE_ROLE_KEY" \
+        "$PG_META_CRYPTO_KEY" \
+        "$VAULT_ENC_KEY" \
+        "$SECRET_KEY_BASE" \
+        "$POOLER_TENANT_ID"
+    
+    # Показываем ключи пользователю
+    echo ""
+    show_keys_to_user
+    echo ""
+    read -rp "Нажмите Enter чтобы продолжить..."
 }
 
-main() {
-    print_header "Автоматический установщик Supabase"
-
-    check_ubuntu_version
-    install_docker
-    check_already_installed
-
-    if $ALREADY_INSTALLED; then
-        print_success "Supabase уже настроен — ничего не делаем."
-        exit 0
-    fi
-
-    detect_n8n
-    setup_parameters
-    generate_secrets_if_needed
-    post_setup_questions
-
-    if $USE_EXISTING_N8N; then
-        add_to_n8n
+update_env_value() {
+    local key="$1"
+    local value="$2"
+    if grep -q "^$key=" "$PROJECT_DIR/.env"; then
+        sed -i "s|^$key=.*|$key=$value|" "$PROJECT_DIR/.env"
     else
-        full_install
+        echo "$key=$value" >> "$PROJECT_DIR/.env"
     fi
-
-    print_header "ГОТОВО!"
-    print_success "Supabase Studio: https://${SUBDOMAIN}.${MAIN_DOMAIN}"
 }
 
-case "${1:-}" in
-    --help|-h)
-        echo "Автоматический установщик Supabase"
-        echo "Поддерживает интеграцию с n8n и автономную установку"
-        ;;
-    *)
-        main
-        ;;
-esac
+save_keys_to_file() {
+    local domain="$1"
+    shift
+    local dash_user="$1"
+    shift
+    local dash_pass="$1"
+    shift
+    
+    KEY_FILE="$SCRIPT_DIR/supabase-keys-$(date +%Y%m%d-%H%M%S).txt"
+    
+    cat > "$KEY_FILE" <<EOF
+==========================================
+🔥 ВАЖНО! Сохраните эти ключи в надежное место 🔥
+==========================================
+Домен: https://$domain
+Пользователь панели: $dash_user
+Пароль панели: $dash_pass
+
+POSTGRES_PASSWORD: $1
+JWT_SECRET: $2
+ANON_KEY: $3
+SERVICE_ROLE_KEY: $4
+
+Дополнительные ключи безопасности:
+PG_META_CRYPTO_KEY: $5
+VAULT_ENC_KEY: $6
+SECRET_KEY_BASE: $7
+POOLER_TENANT_ID: $8
+==========================================
+Эти ключи необходимы для подключения к Supabase!
+Файл .env: $PROJECT_DIR/.env
+Файл с ключами: $KEY_FILE
+==========================================
+EOF
+    
+    # Сохраняем путь к файлу с ключами
+    LATEST_KEY_FILE="$KEY_FILE"
+}
+
+show_keys_to_user() {
+    if [[ -f "$LATEST_KEY_FILE" ]]; then
+        cat "$LATEST_KEY_FILE"
+    else
+        echo "⚠️  Файл с ключами не найден"
+    fi
+}
+
+fix_docker_compose() {
+    echo "🔧 Проверяем docker-compose.yml на наличие проблем..."
+    local compose_file="$PROJECT_DIR/docker-compose.yml"
+    
+    if [[ -f "$compose_file" ]]; then
+        # Исправляем ошибку с Docker socket в volumes если есть
+        if grep -q "/var/run/docker.sock:ro,z" "$compose_file"; then
+            sed -i 's|/var/run/docker.sock:ro,z|/var/run/docker.sock:ro|g' "$compose_file"
+            echo "✅ Исправлена ошибка с Docker socket"
+        fi
+        
+        # Исправляем относительные пути volumes если нужно
+        sed -i 's|\./volumes/|./volumes/|g' "$compose_file"
+        
+        # Добавляем restart политику в docker-compose.yml если её нет
+        if ! grep -q "restart:" "$compose_file"; then
+            echo "⚡ Добавляем политику restart в docker-compose.yml..."
+            # Это сложная операция, лучше сделать backup
+            cp "$compose_file" "$compose_file.backup"
+            
+            # Добавляем restart: unless-stopped ко всем сервисам
+            sed -i '/^services:/a\\n  # Auto-restart policy' "$compose_file"
+            sed -i '/^  [a-z]/ s/$/\n    restart: unless-stopped/' "$compose_file"
+            echo "✅ Политика restart добавлена"
+        fi
+        
+        echo "✅ docker-compose.yml проверен"
+    else
+        echo "⚠️  Файл docker-compose.yml не найден в $PROJECT_DIR"
+        return 1
+    fi
+}
+
+start_supabase() {
+    echo "🚀 Запускаем Supabase..."
+    cd "$PROJECT_DIR"
+    
+    # Создаем volumes директории если их нет
+    mkdir -p volumes/postgres volumes/storage volumes/logs
+    
+    # Запускаем контейнеры
+    docker compose pull
+    docker compose up -d
+    
+    echo "⏳ Ожидаем запуск сервисов (30 секунд)..."
+    sleep 30
+    
+    echo "📊 Статус контейнеров:"
+    docker compose ps
+    cd "$SCRIPT_DIR"
+}
+
+configure_nginx() {
+    echo "🌐 Настраиваем Nginx..."
+    sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+    
+    # Создаем Basic Auth файл
+    echo "$DASH_PASS" | sudo htpasswd -ci /etc/nginx/.htpasswd "$DASH_USER"
+    
+    # Конфигурация Nginx
+    sudo cat > /etc/nginx/sites-available/supabase <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $MAIN_DOMAIN;
+    
+    # Redirect all HTTP to HTTPS
+    return 301 https://\$server_name\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $MAIN_DOMAIN;
+
+    # SSL certificates will be added by certbot
+    ssl_certificate /etc/letsencrypt/live/$MAIN_DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$MAIN_DOMAIN/privkey.pem;
+    
+    # SSL settings
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-RSA-AES256-GCM-SHA512:DHE-RSA-AES256-GCM-SHA512:ECDHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        
+        # Basic Auth для защиты dashboard
+        auth_basic "Restricted Access";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+    }
+    
+    # Health check endpoint без аутентификации
+    location /health {
+        proxy_pass http://localhost:8000/health;
+        auth_basic off;
+    }
+    
+    # API endpoints без basic auth для клиентских приложений
+    location ~ ^/(auth|rest|storage|realtime)/v1/ {
+        proxy_pass http://localhost:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+        auth_basic off;
+    }
+}
+EOF
+    
+    # Активируем конфигурацию
+    sudo ln -sf /etc/nginx/sites-available/supabase /etc/nginx/sites-enabled/
+    sudo rm -f /etc/nginx/sites-enabled/default
+    
+    # Включаем автозапуск Nginx
+    sudo systemctl enable nginx
+    echo "✅ Nginx настроен на автозапуск"
+}
+
+setup_ssl() {
+    echo "🔐 Настраиваем SSL..."
+    
+    # Временно останавливаем Nginx для Certbot
+    sudo systemctl stop nginx
+    
+    echo "⏳ Получаем SSL сертификат для $MAIN_DOMAIN..."
+    if sudo certbot certonly --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$LE_EMAIL" \
+        --domains "$MAIN_DOMAIN"; then
+        
+        echo "✅ SSL сертификат успешно получен"
+    else
+        echo "⚠️  Не удалось получить SSL сертификат от Let's Encrypt"
+        echo "Создаем self-signed сертификат для теста..."
+        
+        sudo mkdir -p /etc/nginx/ssl
+        sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/nginx/ssl/selfsigned.key \
+            -out /etc/nginx/ssl/selfsigned.crt \
+            -subj "/C=US/ST=State/L=City/O=Organization/CN=$MAIN_DOMAIN"
+        
+        # Обновляем Nginx конфиг
+        sudo sed -i "s|ssl_certificate /etc/letsencrypt/live/$MAIN_DOMAIN/fullchain.pem;|ssl_certificate /etc/nginx/ssl/selfsigned.crt;|" /etc/nginx/sites-available/supabase
+        sudo sed -i "s|ssl_certificate_key /etc/letsencrypt/live/$MAIN_DOMAIN/privkey.pem;|ssl_certificate_key /etc/nginx/ssl/selfsigned.key;|" /etc/nginx/sites-available/supabase
+    fi
+    
+    # Запускаем Nginx обратно
+    sudo systemctl start nginx
+    
+    # Проверяем конфигурацию Nginx
+    echo "🔧 Проверяем конфигурацию Nginx..."
+    if sudo nginx -t; then
+        sudo systemctl reload nginx
+        echo "✅ Nginx сконфигурирован корректно"
+    else
+        echo "❌ Ошибка в конфигурации Nginx"
+        sudo nginx -t
+        return 1
+    fi
+    
+    # Настраиваем автоматическое обновление
+    echo "🔄 Настраиваем автоматическое обновление SSL сертификатов..."
+    sudo cat > /etc/cron.daily/renew-certbot <<'EOF'
+#!/bin/bash
+if [ -d "/etc/letsencrypt/live" ]; then
+    certbot renew --quiet --post-hook "systemctl reload nginx"
+fi
+EOF
+    sudo chmod +x /etc/cron.daily/renew-certbot
+}
+
+configure_firewall() {
+    echo "🔥 Настраиваем фаервол UFW..."
+    
+    # Проверяем установлен ли UFW
+    if ! command -v ufw &>/dev/null; then
+        echo "📦 Устанавливаем UFW..."
+        sudo apt-get install -y ufw
+    fi
+    
+    # Настраиваем UFW
+    sudo ufw --force disable 2>/dev/null || true
+    echo "y" | sudo ufw reset
+    
+    sudo ufw default deny incoming
+    sudo ufw default allow outgoing
+    sudo ufw allow ssh
+    sudo ufw allow http
+    sudo ufw allow https
+    
+    # Блокируем внутренние порты Supabase
+    sudo ufw deny 8000/tcp   # Studio
+    sudo ufw deny 5432/tcp   # PostgreSQL
+    sudo ufw deny 54321/tcp  # Kong
+    sudo ufw deny 54322/tcp  # Auth
+    sudo ufw deny 54323/tcp  # Storage
+    sudo ufw deny 54324/tcp  # Realtime
+    
+    # Включаем UFW
+    echo "y" | sudo ufw enable
+    
+    echo "✅ Фаервол настроен"
+    sudo ufw status verbose
+}
+
+verify_installation() {
+    echo ""
+    echo "=== Проверка установки ==="
+    
+    # Ждем полного запуска сервисов
+    echo "⏳ Ожидаем полный запуск сервисов (еще 30 секунд)..."
+    sleep 30
+    
+    # Проверяем контейнеры
+    echo ""
+    echo "📊 Статус контейнеров Supabase:"
+    cd "$PROJECT_DIR"
+    docker compose ps
+    cd "$SCRIPT_DIR"
+    
+    # Проверяем локальную доступность
+    echo ""
+    echo "🔄 Проверяем локальную доступность Supabase Studio..."
+    if curl -s -f -o /dev/null -w "Локальный статус: %{http_code}\n" http://localhost:8000/health; then
+        echo "✅ Supabase Studio запущен локально на порту 8000"
+    else
+        echo "⚠️  Supabase Studio не отвечает локально"
+        echo "Проверьте логи: cd $PROJECT_DIR && docker compose logs"
+    fi
+    
+    # Проверяем доступность через Nginx
+    echo ""
+    echo "🔄 Проверяем доступность через Nginx (с аутентификацией)..."
+    if curl -s -f -o /dev/null -w "Nginx статус: %{http_code}\n" -u "$DASH_USER:$DASH_PASS" https://$MAIN_DOMAIN/health 2>/dev/null; then
+        echo "✅ Supabase доступен через Nginx с SSL и аутентификацией"
+    else
+        echo "⚠️  Проблемы с доступом через Nginx"
+    fi
+    
+    # Проверяем API endpoints без аутентификации
+    echo ""
+    echo "🔄 Проверяем API endpoints..."
+    if curl -s -f -o /dev/null -w "API статус: %{http_code}\n" https://$MAIN_DOMAIN/rest/v1/ 2>/dev/null; then
+        echo "✅ API доступен без аутентификации (как настроено)"
+    else
+        echo "⚠️  API не отвечает"
+    fi
+}
+
+print_summary() {
+    echo ""
+    echo "=========================================="
+    echo "✅ УСТАНОВКА ЗАВЕРШЕНА!"
+    echo "=========================================="
+    echo ""
+    echo "🌐 Supabase Studio: https://$MAIN_DOMAIN"
+    echo "👤 Пользователь: $DASH_USER"
+    echo "🔑 Пароль: $DASH_PASS"
+    echo ""
+    echo "🔧 Ключевые эндпоинты:"
+    echo "   Dashboard: https://$MAIN_DOMAIN"
+    echo "   REST API: https://$MAIN_DOMAIN/rest/v1/"
+    echo "   Auth API: https://$MAIN_DOMAIN/auth/v1/"
+    echo "   Storage API: https://$MAIN_DOMAIN/storage/v1/"
+    echo "   Realtime API: https://$MAIN_DOMAIN/realtime/v1/"
+    echo ""
+    echo "💾 Расположение файлов:"
+    echo "   Конфигурация: $PROJECT_DIR/"
+    echo "   Файл .env: $PROJECT_DIR/.env"
+    echo "   Docker compose: $PROJECT_DIR/docker-compose.yml"
+    
+    # Показываем последний файл с ключами
+    local key_files=("$SCRIPT_DIR"/supabase-keys-*.txt)
+    if [[ ${#key_files[@]} -gt 0 ]] && [[ -f "${key_files[0]}" ]]; then
+        local latest_key_file=$(ls -t "$SCRIPT_DIR"/supabase-keys-*.txt | head -1)
+        echo "   Файл с ключами: $latest_key_file"
+        echo ""
+        echo "🔐 Ключи безопасности сохранены в файле выше."
+        echo "   Сохраните этот файл в надежное место!"
+    fi
+    
+    echo ""
+    echo "⚡ АВТОЗАПУСК НАСТРОЕН:"
+    echo "   Supabase будет автоматически запускаться при перезагрузке сервера"
+    echo ""
+    echo "⚙️ Команды управления через systemd:"
+    echo "   Статус Supabase: sudo systemctl status supabase"
+    echo "   Запуск Supabase: sudo systemctl start supabase"
+    echo "   Остановка Supabase: sudo systemctl stop supabase"
+    echo "   Перезапуск Supabase: sudo systemctl restart supabase"
+    echo "   Просмотр логов: sudo journalctl -u supabase -f"
+    echo ""
+    echo "⚙️ Команды управления через Docker Compose:"
+    echo "   Просмотр логов: cd $PROJECT_DIR && docker compose logs"
+    echo "   Просмотр логов сервиса: docker compose logs [service_name]"
+    echo "   Остановка: cd $PROJECT_DIR && docker compose down"
+    echo "   Запуск: cd $PROJECT_DIR && docker compose up -d"
+    echo ""
+    echo "🔄 Обновление:"
+    echo "   Обновить docker-compose файлы: $0
